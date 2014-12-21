@@ -1,0 +1,222 @@
+---
+title: "Practical Machine Learning project"
+author: "Justas Godliauskas"
+date: "20 Dec 2014"
+output: html_document
+---
+
+**Short summary**  
+Some cleaning of the data is performed at first. Also number of features is reduced to 14 from 158, by removing ones with high correlation among each other and ones that have very small correlation with predicted variable. Also remove
+features that have many NA values.
+
+Simple cross-validation is used. Avoid k-folds because of long computation time.
+Simply split train data to training and testing sets.
+
+Evaluate 3 models: boosting, random forest and simple trees on training set.
+Select one that performes best on testing set.
+
+Random forest turns out to be the best, giving ~96% accuracy on testing set.
+And as found out later 20/20 score on the submission.
+
+```{r, message = FALSE}
+library(RCurl)
+library(caret)
+library(randomForest)
+
+# get training and test data
+myCsv1 <- getURL("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv")
+dt1 <- read.csv(textConnection(myCsv1))
+TRAIN <- dt1[, !colnames(dt1) %in% "X"]
+
+myCsv2 <- getURL("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv")
+dt2 <- read.csv(textConnection(myCsv2))
+test <- dt2[, !colnames(dt2) %in% "X"]
+
+# identify features in test data that have only NA
+allna <- sapply(test, function(k) all(is.na(k)))
+allna.names <- names(allna[allna])
+```
+First, check features and reduce them in order to reduce estimation time and avoid overfitting.
+
+```{r}
+# ignore NA variables
+TRAIN <- TRAIN[, !colnames(TRAIN) %in% allna.names]
+test <- test[, !colnames(test) %in% allna.names]
+
+# now each of belt, arm, forearm, dumbbell has 13 features
+# identify factors (that are characters)
+classes <- sapply(TRAIN, class)
+factors <- names(classes[classes == "factor"])
+# there 3 factors as a features
+# two of them show no relation to predictable variable, remove them
+table(TRAIN[, c("user_name", "classe")]) 
+table(TRAIN[, c("new_window", "classe")]) 
+remove <- c("user_name", "new_window")
+TRAIN <- TRAIN[, !colnames(TRAIN) %in% remove]
+test <- test[, !colnames(test) %in% remove]
+
+table(TRAIN[, c("cvtd_timestamp", "classe")])
+
+# cvtd_timestamp looks very important, need to format it to make use of it
+# Note that earlier the excercise is perfomed the better it is done
+formatDate <- function(x){
+    x <- substr(x, 12, 16)
+    x <- strsplit(x, ":")
+    x <- lapply(x, function(k){
+        as.numeric(k[1]) * 60 + as.numeric(k[2])
+    })
+    x <- Reduce("c", x)
+    x <- c(0, diff(x))
+    x[abs(x) > 1] <- 0
+    which.zeros <- x == 0
+    temp <- cumsum(x)[which.zeros]
+    temp <- -c(0, rev(diff(rev(temp))))
+    x[which.zeros] <- -temp
+    x <- cumsum(x)
+    x
+}
+
+FixTimeStamp <- function(x){
+    x[, "cvtd_timestamp"] <- as.character(x[, "cvtd_timestamp"])
+    unique.stamp <- sort(unique(x[, "cvtd_timestamp"]))
+    unique.stamp.short <- formatDate(unique.stamp)
+
+    for (i in 1:length(unique.stamp)){
+        x[, "cvtd_timestamp"] <- gsub(unique.stamp[i], unique.stamp.short[i],
+                                      x[, "cvtd_timestamp"])
+    }
+    x[, "cvtd_timestamp"] <- as.integer(x[, "cvtd_timestamp"])
+    x
+}
+
+TRAIN <- FixTimeStamp(TRAIN)
+test <- FixTimeStamp(test)
+```
+Number of features may still be too big. Try to identify ones that have high correlation among each other and very low correlation with **classe** variable. Perform basic *Pearson* correlation and do not pay too much attention to assumptions.
+```{r}
+# change categorical variables to integers, in orider to perform correlations
+not.numeric <- !sapply(TRAIN[1, ], is.numeric)
+not.numeric <- not.numeric[not.numeric]
+
+# only classe variable is as character now
+# transform it to number
+TRAIN$classe <- as.numeric(as.factor(TRAIN$classe))
+
+# remove features that have correlations with classe < 0.1 in absolute terms
+cors <- abs(cor(TRAIN)[, "classe"])
+rem.features1 <- names(cors[cors < 0.1])
+TRAIN <- TRAIN[, !colnames(TRAIN) %in% rem.features1]
+test <- test[, !colnames(test) %in% rem.features1]
+
+cors <- cor(TRAIN[, !colnames(TRAIN) %in% "classe"])
+# features that are very correlated with each other
+cors[lower.tri(cors, diag = TRUE)] <- 0
+cor.features <- list()
+for (col in colnames(cors)){
+    row <- rownames(cors)[which(cors[, col] > 0.8)]
+    if (length(row) == 0)
+        next
+    else
+        cor.features <- c(cor.features, list(c(row, col)))
+}
+
+rem.features2 <- c()
+while(length(cor.features) > 0){
+    for (i in 1:length(cor.features)){
+        pairs <- cor.features[[i]]
+        pairs <- pairs[!pairs %in% rem.features2]
+        if (length(pairs) < 2){
+            cor.features[i] <- NA
+            next
+        }
+        take <- cor.features[[i]][1]
+        pairs <- pairs[!pairs %in% take]
+        if (length(pairs) < 2){
+            cor.features[i] <- NA
+        }
+        cor.features[[i]] <- pairs
+        rem.features2 <- c(rem.features2, take)
+    }
+    cor.features <- cor.features[!sapply(cor.features, function(k) 
+        all(is.na(k)))]
+}
+
+TRAIN <- TRAIN[, !colnames(TRAIN) %in% rem.features2]
+test <- test[, !colnames(test) %in% rem.features2]
+# features to remove
+rem.features <- c(rem.features1, rem.features2)
+```
+Done with data preparation. There are 14 features left plus predicted variable.
+```{r}
+colnames(TRAIN)
+```
+Fit models now. In order to save time and keep it simple basic cross-validation is used. Training set is split to training and testing sets. Evaluation of few different models is performed on training set, and performance tested on testing set. Based on accuracy of prediction one model is selected for final prediction.
+```{r}
+# not important transformation
+TRAIN$classe <- as.character(TRAIN$classe)
+TRAIN$classe <- gsub("1", "A", TRAIN$classe)
+TRAIN$classe <- gsub("2", "B", TRAIN$classe)
+TRAIN$classe <- gsub("3", "C", TRAIN$classe)
+TRAIN$classe <- gsub("4", "D", TRAIN$classe)
+TRAIN$classe <- gsub("5", "E", TRAIN$classe)
+TRAIN$classe <- factor(TRAIN$classe)
+
+# create training and testing sets
+set.seed(100)
+f <- createDataPartition(y = TRAIN$classe, p = 0.75, list = FALSE)
+training <- TRAIN[f, ]
+testing <- TRAIN[-f, ]
+```
+Boosting method performes quite well, giving ~90% accuracy
+```{r, message=FALSE}
+# fit boosting model
+fit.bo <- train(classe ~ ., data = training, method = "gbm", 
+                verbose = FALSE)
+p.bo <- predict(fit.bo, testing)
+res.bo <- p.bo == testing$classe
+res.bo <- sum(res.bo)/(length(res.bo)) * 100 # precentage of correct predictions
+res.bo
+```
+```{r, message=FALSE,echo=FALSE}
+gc() # to save memory
+```
+Random forest work extremely well. ntree = 10 is chosen because higher number of trees increases computation time significantly.
+```{r, message=FALSE}
+# fit random forests
+fit.rf <- randomForest(classe ~ ., data = training, importance = FALSE,
+                       proximity = TRUE, ntree = 10)
+p.rf <- predict(fit.rf, testing)
+res.rf <- p.rf == testing$classe
+res.rf <- sum(res.rf)/(length(res.rf)) * 100 # precentage of correct predictions
+res.rf
+```
+```{r, message=FALSE, echo=FALSE}
+gc()
+```
+Basic predicting with trees as expected does not look very promosing.
+```{r, message=FALSE}
+# fit with trees
+fit.t <- train(classe ~ ., data = training, method = "rpart")
+p.t <- predict(fit.t, testing)
+res.t <- p.t == testing$classe
+res.t <- sum(res.t)/(length(res.t)) * 100 # precentage of correct predictions
+res.t
+```
+```{r, message=FALSE, echo=FALSE}
+gc()
+```
+Visualise results. The best is **Random Forest** and it is chosen for final prediction. This method gave ~96% accuracy.
+```{r}
+# make histogram
+hist.dt <- data.frame(Type = c("Boosting", "Random Forest", "Trees"),
+                      Accuracy = c(res.bo, res.rf, res.t))
+ggplot(hist.dt, aes(x = Type, weight = Accuracy)) +
+    geom_bar(fill = "white", colour = "black")+
+    geom_text(aes(y = 25, label = round(Accuracy, 1)))+
+    labs(x = NULL, y = "Accuracy")
+```
+Final prediction:
+```{r}
+# predict test set with rendom forest
+prediction <- predict(fit.rf, newdata = test)
+```
